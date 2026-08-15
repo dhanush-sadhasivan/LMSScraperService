@@ -1,0 +1,18 @@
+{
+  "name": "hackerrank-scraper-service",
+  "version": "1.0.0",
+  "description": "HackerRank scraper service for LMS — authenticates via Puppeteer, fetches data via raw HTTP, writes directly to Supabase.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.1",
+    "puppeteer": "^23.11.1",
+    "uuid": "^10.0.0"
+  }
+}
