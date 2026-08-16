@@ -2,10 +2,8 @@
  * Challenges Scraper
  *
  * Fetches all challenges (questions) for a contest from HackerRank
- * and writes them directly to the Supabase `questions` table.
- *
- * Resolves the contest_id from the DB using the hackerrank_slug.
- * Upserts on (contest_id, slug) to safely re-run without duplicates.
+ * and writes them directly to the Supabase `questions` table if contest exists,
+ * or returns them for preview mode if creating a new contest.
  */
 
 const { authenticate } = require('./auth');
@@ -13,97 +11,131 @@ const hr = require('./hackerrank');
 const { getSupabaseClient } = require('./supabaseClient');
 
 /**
- * Scrape all challenges for a contest and persist to DB.
+ * Scrape all challenges for a contest and persist to DB if contestId resolved.
  *
  * @param {string} contestSlug  HackerRank contest slug (e.g. "fp-trainers-a-algorithm")
  * @param {string|null} contestId  Optional Supabase contest ID; if null, will be looked up by slug
- * @returns {Promise<{ contestId: string, questions: Array, count: number }>}
+ * @returns {Promise<{ contestId: string|null, questions: Array, count: number }>}
  */
 async function run(contestSlug, contestId = null) {
   const supabase = getSupabaseClient();
 
   console.log(`\n[challenges] ▶ Scraping challenges for: ${contestSlug}`);
 
-  // ── Resolve contest from DB ────────────────────────────────────────────────
+  // ── Resolve contest from DB if not provided ─────────────────────────────
   let resolvedContestId = contestId;
 
   if (!resolvedContestId) {
-    const { data: contest, error } = await supabase
-      .from('contests')
-      .select('id')
-      .eq('hackerrank_slug', contestSlug)
-      .maybeSingle();
+    try {
+      const { data: contest } = await supabase
+        .from('contests')
+        .select('id')
+        .eq('hackerrank_slug', contestSlug)
+        .maybeSingle();
 
-    if (error) throw new Error(`DB error looking up contest: ${error.message}`);
-    if (!contest) throw new Error(`Contest with slug "${contestSlug}" not found in database. Create it first.`);
-
-    resolvedContestId = contest.id;
+      if (contest) {
+        resolvedContestId = contest.id;
+      }
+    } catch (err) {
+      console.warn(`[challenges] Warning looking up contest in DB: ${err.message}`);
+    }
   }
 
-  console.log(`[challenges] Contest DB ID: ${resolvedContestId}`);
+  console.log(`[challenges] Contest DB ID: ${resolvedContestId || 'None (Preview Mode)'}`);
 
   // ── Authenticate ───────────────────────────────────────────────────────────
   const email = process.env.HACKERRANK_EMAIL;
   const password = process.env.HACKERRANK_PASSWORD;
-  if (!email || !password) throw new Error('HACKERRANK_EMAIL / HACKERRANK_PASSWORD not set');
+  if (!email || !password) throw new Error('HACKERRANK_EMAIL / HACKERRANK_PASSWORD environment variables are not set.');
 
   const client = await authenticate(email, password);
 
   // ── Fetch challenges from HackerRank ───────────────────────────────────────
   const challenges = await hr.fetchChallenges(client, contestSlug);
 
-  if (challenges.length === 0) {
-    throw new Error(`No challenges found for contest "${contestSlug}". Check the slug and your HackerRank access.`);
+  if (!challenges || challenges.length === 0) {
+    throw new Error(`No challenges found for contest "${contestSlug}". Check if the slug is correct and accessible on HackerRank.`);
   }
 
-  console.log(`[challenges] Found ${challenges.length} challenges`);
+  console.log(`[challenges] Found ${challenges.length} challenges on HackerRank`);
 
-  // ── Build DB rows ──────────────────────────────────────────────────────────
+  // ── Build DB / Preview rows ────────────────────────────────────────────────
   const BASE_URL = 'https://www.hackerrank.com';
   const now = new Date().toISOString();
 
-  const rows = challenges.map((c, idx) => ({
-    contest_id: resolvedContestId,
-    slug: c.slug,
-    title: c.name,
-    difficulty: c.difficulty,
-    max_score: Math.max(0, Math.round(parseFloat(c.maxScore) || 10)),
-    domain: c.domain || 'General',
-    hackerrank_url: `${BASE_URL}/contests/${contestSlug}/challenges/${c.slug}`,
-    order_index: c.order ?? idx,
-  }));
+  const rows = challenges.map((c, idx) => {
+    const rawTitle = c.name || '';
+    let extractedTopic = null;
+    if (rawTitle.includes('-')) {
+      const prefix = rawTitle.split('-')[0].trim();
+      if (prefix.length > 0) {
+        extractedTopic = prefix.charAt(0).toUpperCase() + prefix.slice(1);
+      }
+    } else if (c.domain && c.domain.toLowerCase() !== 'general' && c.domain.toLowerCase() !== 'dsa') {
+      extractedTopic = c.domain.trim();
+    }
 
-  // ── Upsert to Supabase ─────────────────────────────────────────────────────
-  // Delete existing questions and re-insert to keep ordering accurate
-  // (upsert doesn't cleanly handle removed questions)
-  const { error: deleteErr } = await supabase
-    .from('questions')
-    .delete()
-    .eq('contest_id', resolvedContestId);
+    return {
+      contest_id: resolvedContestId,
+      slug: c.slug,
+      title: c.name,
+      displayTitle: c.name,
+      topic: extractedTopic,
+      difficulty: c.difficulty || 'Medium',
+      max_score: Math.max(0, Math.round(parseFloat(c.maxScore) || 10)),
+      maxScore: Math.max(0, Math.round(parseFloat(c.maxScore) || 10)),
+      domain: c.domain || 'General',
+      hackerrank_url: `${BASE_URL}/contests/${contestSlug}/challenges/${c.slug}`,
+      questionLink: `${BASE_URL}/contests/${contestSlug}/challenges/${c.slug}`,
+      order_index: c.order ?? idx,
+    };
+  });
 
-  if (deleteErr) {
-    console.warn(`[challenges] Warning: could not delete existing questions: ${deleteErr.message}`);
+  // ── Upsert to Supabase if resolvedContestId exists ─────────────────────────
+  let inserted = null;
+  if (resolvedContestId) {
+    const { error: deleteErr } = await supabase
+      .from('questions')
+      .delete()
+      .eq('contest_id', resolvedContestId);
+
+    if (deleteErr) {
+      console.warn(`[challenges] Warning: could not delete existing questions: ${deleteErr.message}`);
+    }
+
+    const { data: insertedRows, error: insertErr } = await supabase
+      .from('questions')
+      .insert(rows.map(r => ({
+        contest_id: r.contest_id,
+        slug: r.slug,
+        title: r.title,
+        topic: r.topic,
+        difficulty: r.difficulty,
+        max_score: r.max_score,
+        domain: r.domain,
+        hackerrank_url: r.hackerrank_url,
+        order_index: r.order_index,
+      })))
+      .select('id, slug, title, topic, difficulty, max_score, domain, order_index');
+
+    if (insertErr) {
+      console.error(`[challenges] Failed to insert questions into DB: ${insertErr.message}`);
+    } else {
+      inserted = insertedRows;
+    }
+
+    await supabase
+      .from('contests')
+      .update({ last_scraped_at: now })
+      .eq('id', resolvedContestId);
   }
 
-  const { data: inserted, error: insertErr } = await supabase
-    .from('questions')
-    .insert(rows)
-    .select('id, slug, title, difficulty, max_score, domain, order_index');
-
-  if (insertErr) throw new Error(`Failed to insert questions: ${insertErr.message}`);
-
-  // ── Update last_scraped_at ─────────────────────────────────────────────────
-  await supabase
-    .from('contests')
-    .update({ last_scraped_at: now })
-    .eq('id', resolvedContestId);
-
-  console.log(`[challenges] ✅ Inserted ${inserted?.length ?? rows.length} questions into DB`);
+  console.log(`[challenges] ✅ Successfully processed ${challenges.length} questions for "${contestSlug}"`);
 
   return {
     contestId: resolvedContestId,
     questions: inserted || rows,
-    count: inserted?.length ?? rows.length,
+    count: challenges.length,
   };
 }
 
