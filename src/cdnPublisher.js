@@ -102,7 +102,6 @@ async function publishGlobalLeaderboard() {
       const { data: pageRows, error: pErr } = await supabase
         .from('progress')
         .select('user_id, score, status')
-        .not('contest_id', 'is', null)
         .or('score.gt.0,status.eq.solved')
         .range(pFrom, pFrom + pStep - 1);
 
