@@ -64,27 +64,20 @@ async function run(contestSlug, contestId = null) {
   const now = new Date().toISOString();
 
   const rows = challenges.map((c, idx) => {
-    const rawTitle = c.name || '';
-    let extractedTopic = null;
-    if (rawTitle.includes('-')) {
-      const prefix = rawTitle.split('-')[0].trim();
-      if (prefix.length > 0) {
-        extractedTopic = prefix.charAt(0).toUpperCase() + prefix.slice(1);
-      }
-    } else if (c.domain && c.domain.toLowerCase() !== 'general' && c.domain.toLowerCase() !== 'dsa') {
-      extractedTopic = c.domain.trim();
-    }
+    // Domain is already intelligently extracted by hackerrank.js fetchChallenges
+    // (title-prefix heuristic → HR track/category → 'General' fallback)
+    const domain = c.domain || 'General';
 
     return {
       contest_id: resolvedContestId,
       slug: c.slug,
       title: c.name,
       displayTitle: c.name,
-      topic: extractedTopic,
+      topic: domain,
       difficulty: c.difficulty || 'Medium',
       max_score: Math.max(0, Math.round(parseFloat(c.maxScore) || 10)),
       maxScore: Math.max(0, Math.round(parseFloat(c.maxScore) || 10)),
-      domain: c.domain || 'General',
+      domain: domain,
       hackerrank_url: `${BASE_URL}/contests/${contestSlug}/challenges/${c.slug}`,
       questionLink: `${BASE_URL}/contests/${contestSlug}/challenges/${c.slug}`,
       order_index: c.order ?? idx,

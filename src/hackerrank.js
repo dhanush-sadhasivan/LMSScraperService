@@ -35,6 +35,49 @@ async function apiGet(client, url) {
   }
 }
 
+// ─── Domain extraction ────────────────────────────────────────────────────────
+
+/**
+ * Generic / unhelpful domain values that HackerRank returns for custom contests.
+ * When the API returns one of these we should NOT trust it as a meaningful category.
+ */
+const GENERIC_DOMAINS = new Set([
+  'ai', 'algorithms', 'general', 'dsa', 'practice', 'challenge', 'contest',
+  'master', 'test', 'assessment', 'certification', 'other',
+]);
+
+/**
+ * Try to extract a meaningful domain / category from a challenge object.
+ *
+ * Priority:
+ *  1. Title-prefix heuristic  —  "Arrays - Two Sum"  → "Arrays"
+ *  2. HackerRank track / domain / category  (only if NOT generic)
+ *  3. null  (caller should fallback to 'General')
+ *
+ * @param {{ name?: string, title?: string, track?: { name?: string }, domain?: string, category?: string }} challenge
+ * @returns {string|null}
+ */
+function extractDomain(challenge) {
+  // 1. Title-prefix heuristic: "Topic - Question Name"
+  const rawTitle = challenge.name || challenge.title || '';
+  if (rawTitle.includes('-')) {
+    const prefix = rawTitle.split('-')[0].trim();
+    if (prefix.length > 0 && prefix.length < 40) {
+      // Capitalise first letter
+      return prefix.charAt(0).toUpperCase() + prefix.slice(1);
+    }
+  }
+
+  // 2. HackerRank track / domain / category — skip generic values
+  const hrDomain = challenge.track?.name || challenge.domain || challenge.category || '';
+  if (hrDomain && !GENERIC_DOMAINS.has(hrDomain.toLowerCase().trim())) {
+    return hrDomain.trim();
+  }
+
+  // 3. Nothing useful found
+  return null;
+}
+
 // ─── Challenges ───────────────────────────────────────────────────────────────
 
 /**
@@ -80,7 +123,7 @@ async function fetchChallenges(client, contestSlug) {
     name: c.name || c.title || c.slug || '',
     difficulty: normalizeDifficulty(c.difficulty_name || c.difficulty),
     maxScore: c.max_score ?? c.points ?? 10,
-    domain: c.track?.name || c.domain || c.category || 'General',
+    domain: extractDomain(c) || 'General',
     order: idx,
   })).filter((c) => c.slug);
 }
