@@ -83,10 +83,22 @@ async function run(jobId, contestId, contestSlug, questions, users) {
 
     const questionIdMap = _buildQuestionIdMap(dbQuestions);
     // ── Step 3.5: Fetch existing user scores from DB for smart skip ──────────
-    const { data: existingDbRows } = await supabase
-      .from('progress')
-      .select('user_id, question_id, status, score, max_score, last_submission_at, updated_at')
-      .eq('contest_id', contestId);
+
+    let existingDbRows = [];
+    let eFrom = 0;
+    const eStep = 1000;
+    while (true) {
+      const { data: ePage } = await supabase
+        .from('progress')
+        .select('contest_id, user_id, question_id, status, score, max_score, last_submission_at, updated_at')
+        .eq('contest_id', contestId)
+        .order('id', { ascending: true })
+        .range(eFrom, eFrom + eStep - 1);
+      if (!ePage || ePage.length === 0) break;
+      existingDbRows = existingDbRows.concat(ePage);
+      if (ePage.length < eStep) break;
+      eFrom += eStep;
+    }
 
     const userDbScoreMap = new Map();
     (existingDbRows || []).forEach(r => {

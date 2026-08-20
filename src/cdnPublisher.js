@@ -70,14 +70,19 @@ async function publishGlobalLeaderboard() {
 
   try {
     // 1. Fetch non-admin user profiles (sanitized fields only)
-    const { data: users, error: uErr } = await supabase
-      .from('users')
-      .select('id, full_name, emp_id, team')
-      .neq('role', 'admin');
-
-    if (uErr || !users) {
-      console.warn('[cdnPublisher] Failed to fetch users for leaderboard:', uErr?.message);
-      return false;
+    let users = [];
+    let uFrom = 0;
+    const uStep = 1000;
+    while (true) {
+      const { data: uPage, error: uErr } = await supabase
+        .from('users').select('id, full_name, emp_id, team')
+        .neq('role', 'admin')
+        .order('id', { ascending: true })
+        .range(uFrom, uFrom + uStep - 1);
+      if (uErr || !uPage || uPage.length === 0) break;
+      users = users.concat(uPage);
+      if (uPage.length < uStep) break;
+      uFrom += uStep;
     }
 
     const userMap = new Map();
@@ -103,6 +108,7 @@ async function publishGlobalLeaderboard() {
         .from('progress')
         .select('user_id, score, status')
         .or('score.gt.0,status.eq.solved')
+        .order('id', { ascending: true })
         .range(pFrom, pFrom + pStep - 1);
 
       if (pErr || !pageRows || pageRows.length === 0) break;
@@ -231,6 +237,7 @@ async function publishContestCache(contestId) {
         .from('progress')
         .select('user_id, question_id, status, score, max_score, last_submission_at, updated_at')
         .eq('contest_id', contestId)
+        .order('id', { ascending: true })
         .range(from, from + step - 1);
 
       if (pErr || !pageRows || pageRows.length === 0) break;

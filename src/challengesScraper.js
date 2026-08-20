@@ -87,34 +87,37 @@ async function run(contestSlug, contestId = null) {
   // ── Upsert to Supabase if resolvedContestId exists ─────────────────────────
   let inserted = null;
   if (resolvedContestId) {
-    const { error: deleteErr } = await supabase
-      .from('questions')
-      .delete()
-      .eq('contest_id', resolvedContestId);
-
-    if (deleteErr) {
-      console.warn(`[challenges] Warning: could not delete existing questions: ${deleteErr.message}`);
-    }
+    const questionsToInsert = rows.map(r => ({
+      contest_id: r.contest_id,
+      slug: r.slug,
+      title: r.title,
+      topic: r.topic,
+      difficulty: r.difficulty,
+      max_score: r.max_score,
+      domain: r.domain,
+      hackerrank_url: r.hackerrank_url,
+      order_index: r.order_index,
+    }));
 
     const { data: insertedRows, error: insertErr } = await supabase
       .from('questions')
-      .insert(rows.map(r => ({
-        contest_id: r.contest_id,
-        slug: r.slug,
-        title: r.title,
-        topic: r.topic,
-        difficulty: r.difficulty,
-        max_score: r.max_score,
-        domain: r.domain,
-        hackerrank_url: r.hackerrank_url,
-        order_index: r.order_index,
-      })))
+      .upsert(questionsToInsert, { onConflict: 'contest_id,slug' })
       .select('id, slug, title, topic, difficulty, max_score, domain, order_index');
 
     if (insertErr) {
       console.error(`[challenges] Failed to insert questions into DB: ${insertErr.message}`);
     } else {
       inserted = insertedRows;
+
+      // Soft-disable questions that were removed from the contest
+      const scrapedSlugs = questionsToInsert.map(q => q.slug);
+      if (scrapedSlugs.length > 0) {
+        await supabase
+          .from('questions')
+          .update({ is_enabled: false })
+          .eq('contest_id', resolvedContestId)
+          .not('slug', 'in', `(${scrapedSlugs.join(',')})`);
+      }
     }
 
     await supabase
