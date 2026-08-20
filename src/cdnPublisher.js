@@ -106,7 +106,7 @@ async function publishGlobalLeaderboard() {
     while (true) {
       const { data: pageRows, error: pErr } = await supabase
         .from('progress')
-        .select('user_id, score, status')
+        .select('user_id, question_id, score, status')
         .or('score.gt.0,status.eq.solved')
         .order('id', { ascending: true })
         .range(pFrom, pFrom + pStep - 1);
@@ -117,12 +117,30 @@ async function publishGlobalLeaderboard() {
       pFrom += pStep;
     }
 
-    // 3. Aggregate scores
+    // 3. Deduplicate by (user_id, question_id) and aggregate scores
+    // A question solved across multiple contests/roadmaps only counts once with highest score
+    const userQuestionMap = new Map();
     allProgressRows.forEach((p) => {
-      const entry = userMap.get(p.user_id);
+      if (!p.user_id || !p.question_id) return;
+      const key = `${p.user_id}:${p.question_id}`;
+      const existing = userQuestionMap.get(key);
+      if (!existing) {
+        userQuestionMap.set(key, {
+          user_id: p.user_id,
+          score: p.score || 0,
+          isSolved: p.status === 'solved',
+        });
+      } else {
+        existing.score = Math.max(existing.score, p.score || 0);
+        if (p.status === 'solved') existing.isSolved = true;
+      }
+    });
+
+    userQuestionMap.forEach((item) => {
+      const entry = userMap.get(item.user_id);
       if (entry) {
-        entry.score += p.score || 0;
-        if (p.status === 'solved') entry.solved++;
+        entry.score += item.score;
+        if (item.isSolved) entry.solved++;
       }
     });
 
