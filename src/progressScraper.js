@@ -16,6 +16,7 @@ const { authenticate } = require('./auth');
 const hr = require('./hackerrank');
 const { getSupabaseClient } = require('./supabaseClient');
 const jobStore = require('./jobStore');
+const cdnPublisher = require('./cdnPublisher');
 
 const CONCURRENCY = 5;          // users processed in parallel
 const BATCH_DELAY_MS = 300;     // delay between concurrent batches
@@ -150,11 +151,18 @@ async function run(jobId, contestId, contestSlug, questions, users) {
       }
     }
 
-    // ── Step 6: Update last_scraped_at ─────────────────────────────────────
+    // ── Step 6: Update last_scraped_at & Publish CDN Cache Snapshots ──────
     await supabase
       .from('contests')
       .update({ last_scraped_at: new Date().toISOString() })
       .eq('id', contestId);
+
+    // Publish CDN Cache to Supabase Storage (api-cache bucket) to save egress
+    try {
+      await cdnPublisher.publishContestAndGlobalCache(contestId);
+    } catch (cdnErr) {
+      console.warn(`[progress] CDN cache generation skipped: ${cdnErr.message}`);
+    }
 
     // Auto-notify LMS to purge and refresh dashboard caches
     const lmsBaseUrl = process.env.LMS_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
