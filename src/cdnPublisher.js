@@ -304,7 +304,47 @@ async function publishContestCache(contestId) {
 }
 
 /**
- * Publish both contest snapshot and global leaderboard snapshot.
+ * Publish roadmap analytics snapshot (roadmap_analytics.json).
+ */
+async function publishRoadmapAnalytics() {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_roadmap_analytics');
+    if (!rpcErr && rpcData) {
+      await _uploadJsonSnapshot('roadmap_analytics.json', {
+        updated_at: new Date().toISOString(),
+        roadmaps: rpcData,
+      });
+      return true;
+    }
+  } catch (err) {
+    console.warn('[cdnPublisher] ⚠️ Error publishing roadmap analytics snapshot:', err.message);
+  }
+  return false;
+}
+
+/**
+ * Publish Internal Training trainer overview snapshot (it_trainer_overview.json).
+ */
+async function publishITTrainerOverview() {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_it_trainer_overview');
+    if (!rpcErr && rpcData) {
+      await _uploadJsonSnapshot('it_trainer_overview.json', {
+        updated_at: new Date().toISOString(),
+        trainers: rpcData,
+      });
+      return true;
+    }
+  } catch (err) {
+    console.warn('[cdnPublisher] ⚠️ Error publishing IT trainer overview snapshot:', err.message);
+  }
+  return false;
+}
+
+/**
+ * Publish contest snapshot, global leaderboard, roadmap analytics, and IT overview snapshots.
  *
  * @param {string} contestId
  */
@@ -313,8 +353,10 @@ async function publishContestAndGlobalCache(contestId) {
     await Promise.all([
       publishContestCache(contestId),
       publishGlobalLeaderboard(),
+      publishRoadmapAnalytics(),
+      publishITTrainerOverview(),
     ]);
-    console.log(`[cdnPublisher] ✅ CDN cache snapshots generated successfully for contest ${contestId}`);
+    console.log(`[cdnPublisher] ✅ All CDN cache snapshots generated successfully for contest ${contestId}`);
   } catch (err) {
     console.warn('[cdnPublisher] ⚠️ Error publishing caches:', err.message);
   }
@@ -323,5 +365,7 @@ async function publishContestAndGlobalCache(contestId) {
 module.exports = {
   publishGlobalLeaderboard,
   publishContestCache,
+  publishRoadmapAnalytics,
+  publishITTrainerOverview,
   publishContestAndGlobalCache,
 };
