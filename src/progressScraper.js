@@ -3,13 +3,15 @@
  *
  * Orchestrates the full flow of:
  *   1. HackerRank login (Puppeteer → cookies → close browser)
- *   2. Leaderboard fetch (bulk, most efficient)
- *   3. Per-user fallback (hackers/challenges endpoint)
- *   4. Per-challenge last resort (slowest path)
+ *      Supports multiple credential pairs: HACKERRANK_EMAIL_1/PASSWORD_1 ... _N
+ *      Falls back to HACKERRANK_EMAIL/PASSWORD if numbered pairs are not configured.
+ *   2. Leaderboard fetch (bulk, most efficient) — done by credential[0], shared
+ *   3. Users partitioned across credentials and processed in parallel
+ *   4. Per-user fallback (hackers/challenges endpoint)
  *   5. Dense upsert of all user-question rows to Supabase
  *
- * All users are processed in concurrent batches of CONCURRENCY to balance
- * speed vs HackerRank rate-limiting.
+ * Multi-credential partitioning distributes API calls evenly across accounts,
+ * dramatically reducing per-account HackerRank rate-limit pressure.
  */
 
 const { authenticate } = require('./auth');
@@ -18,7 +20,7 @@ const { getSupabaseClient } = require('./supabaseClient');
 const jobStore = require('./jobStore');
 const cdnPublisher = require('./cdnPublisher');
 
-const CONCURRENCY = 5;          // users processed in parallel
+const CONCURRENCY = 5;          // users processed in parallel per credential
 const BATCH_DELAY_MS = 300;     // delay between concurrent batches
 const DB_BATCH_SIZE = 500;      // rows per Supabase upsert batch
 
@@ -34,6 +36,83 @@ const DB_BATCH_SIZE = 500;      // rows per Supabase upsert batch
  *   maxScore: number,
  * }} QuestionInput
  */
+
+// ─── Credential pool helpers ──────────────────────────────────────────────────
+
+/**
+ * Load all HackerRank credential pairs from environment variables.
+ * Supports:
+ *   HACKERRANK_EMAIL_1 / HACKERRANK_PASSWORD_1  (highest priority)
+ *   HACKERRANK_EMAIL_2 / HACKERRANK_PASSWORD_2
+ *   ...
+ *   HACKERRANK_EMAIL_N / HACKERRANK_PASSWORD_N
+ *   HACKERRANK_EMAIL   / HACKERRANK_PASSWORD    (fallback / legacy single pair)
+ *
+ * @returns {{ email: string, password: string }[]}
+ */
+function loadCredentials() {
+  const credentials = [];
+
+  // Load numbered pairs first (HACKERRANK_EMAIL_1, HACKERRANK_EMAIL_2, ...)
+  for (let i = 1; i <= 20; i++) {
+    const email = process.env[`HACKERRANK_EMAIL_${i}`];
+    const password = process.env[`HACKERRANK_PASSWORD_${i}`];
+    if (email && password) {
+      credentials.push({ email: email.trim(), password: password.trim() });
+    } else {
+      break; // stop at first gap
+    }
+  }
+
+  // Fallback to legacy single pair if no numbered pairs found
+  if (credentials.length === 0) {
+    const email = process.env.HACKERRANK_EMAIL;
+    const password = process.env.HACKERRANK_PASSWORD;
+    if (email && password) {
+      credentials.push({ email: email.trim(), password: password.trim() });
+    }
+  }
+
+  return credentials;
+}
+
+/**
+ * Partition an array into N roughly-equal chunks (round-robin style).
+ * @template T
+ * @param {T[]} arr
+ * @param {number} n
+ * @returns {T[][]}
+ */
+function partitionRoundRobin(arr, n) {
+  const partitions = Array.from({ length: n }, () => []);
+  arr.forEach((item, idx) => partitions[idx % n].push(item));
+  return partitions;
+}
+
+/**
+ * Authenticate all credentials in parallel. Returns authenticated clients.
+ * If a credential fails, it is skipped and a warning is logged.
+ *
+ * @param {{ email: string, password: string }[]} credentials
+ * @returns {Promise<import('axios').AxiosInstance[]>}
+ */
+async function authenticateAll(credentials) {
+  const results = await Promise.allSettled(
+    credentials.map(({ email, password }) => authenticate(email, password))
+  );
+
+  const clients = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') {
+      clients.push(r.value);
+      console.log(`[progress] ✅ Credential ${i + 1} authenticated (${credentials[i].email})`);
+    } else {
+      console.warn(`[progress] ⚠️  Credential ${i + 1} failed (${credentials[i].email}): ${r.reason?.message}`);
+    }
+  });
+
+  return clients;
+}
 
 /**
  * Run the full progress scrape for a contest.
@@ -55,18 +134,20 @@ async function run(jobId, contestId, contestSlug, questions, users) {
 
   try {
     // ── Step 1: Authenticate ───────────────────────────────────────────────
-    const email = process.env.HACKERRANK_EMAIL;
-    const password = process.env.HACKERRANK_PASSWORD;
-    if (!email || !password) throw new Error('HACKERRANK_EMAIL / HACKERRANK_PASSWORD not set');
-
+    const credentials = loadCredentials();
+    if (credentials.length === 0) throw new Error('No HACKERRANK credentials configured');
+    
     jobStore.updateJob(jobId, { message: 'Logging in to HackerRank...' });
-    const client = await authenticate(email, password);
+    const clients = await authenticateAll(credentials);
+    if (clients.length === 0) throw new Error('All authentication attempts failed');
 
-    // ── Step 2: Fetch full leaderboard (bulk) ─────────────────────────────
+    // ── Step 2: Fetch full leaderboard (bulk) using first client ──────────
     jobStore.updateJob(jobId, { message: 'Fetching leaderboard...' });
-    const { leaderboardMap, isComplete } = await hr.fetchLeaderboard(client, contestSlug);
+    const primaryClient = clients[0];
+    const { leaderboardMap, isComplete } = await hr.fetchLeaderboard(primaryClient, contestSlug);
 
     console.log(`[progress] Leaderboard: ${leaderboardMap.size} entries, complete: ${isComplete}`);
+    console.log(`[progress] Credential pool: ${clients.length} active client(s)`);
 
     // ── Step 3: Resolve question IDs from Supabase ────────────────────────
     const { data: dbQuestions, error: qErr } = await supabase
@@ -111,38 +192,83 @@ async function run(jobId, contestId, contestSlug, questions, users) {
     });
     console.log(`[progress] Loaded existing scores for ${userDbScoreMap.size} users from DB`);
 
-    // ── Step 4: Process users in concurrent batches ────────────────────────
-    jobStore.updateJob(jobId, { message: `Processing ${users.length} users...` });
+    // ── Step 4: Partition users across credential pool & process ──────────
+    jobStore.updateJob(jobId, { message: `Processing ${users.length} users across ${clients.length} credential(s)...` });
 
     /** @type {Array<{contest_id, user_id, question_id, status, score, max_score, last_submission_at, updated_at}>} */
     const allProgressRows = [];
 
-    for (let i = 0; i < users.length; i += CONCURRENCY) {
-      const batch = users.slice(i, i + CONCURRENCY);
+    if (clients.length === 1) {
+      // Single credential: original sequential batch processing
+      const client = clients[0];
+      for (let i = 0; i < users.length; i += CONCURRENCY) {
+        const batch = users.slice(i, i + CONCURRENCY);
 
-      const batchResults = await Promise.all(
-        batch.map((u) =>
-          _processUser(client, contestSlug, contestId, questions, questionIdMap, u, leaderboardMap, isComplete, userDbScoreMap)
-        )
-      );
+        const batchResults = await Promise.all(
+          batch.map((u) =>
+            _processUser(client, contestSlug, contestId, questions, questionIdMap, u, leaderboardMap, isComplete, userDbScoreMap)
+          )
+        );
 
-      for (const rows of batchResults) {
-        allProgressRows.push(...rows);
+        for (const rows of batchResults) {
+          allProgressRows.push(...rows);
+        }
+
+        jobStore.incrementProgress(
+          jobId,
+          batch.length,
+          `Processed ${Math.min(i + CONCURRENCY, users.length)} / ${users.length} users`
+        );
+
+        const remaining = users.length - (i + CONCURRENCY);
+        if (remaining > 0) {
+          await hr.sleep(BATCH_DELAY_MS);
+        }
       }
-
-      jobStore.incrementProgress(
-        jobId,
-        batch.length,
-        `Processed ${Math.min(i + CONCURRENCY, users.length)} / ${users.length} users`
+    } else {
+      // Multiple credentials: partition users round-robin, run partitions in parallel
+      const partitions = partitionRoundRobin(users, clients.length);
+      console.log(`[progress] Partitioned ${users.length} users across ${clients.length} credentials:`);
+      partitions.forEach((p, i) =>
+        console.log(`[progress]   Credential ${i + 1}: ${p.length} users`)
       );
 
-      const remaining = users.length - (i + CONCURRENCY);
-      if (remaining > 0) {
-        await hr.sleep(BATCH_DELAY_MS);
+      let processedCount = 0;
+      const partitionResults = await Promise.all(
+        partitions.map(async (partition, credIdx) => {
+          const client = clients[credIdx];
+          const partitionRows = [];
+
+          for (let i = 0; i < partition.length; i += CONCURRENCY) {
+            const batch = partition.slice(i, i + CONCURRENCY);
+            const batchResults = await Promise.all(
+              batch.map((u) =>
+                _processUser(client, contestSlug, contestId, questions, questionIdMap, u, leaderboardMap, isComplete, userDbScoreMap)
+              )
+            );
+            for (const rows of batchResults) partitionRows.push(...rows);
+
+            processedCount += batch.length;
+            jobStore.incrementProgress(
+              jobId,
+              batch.length,
+              `Processed ${processedCount} / ${users.length} users (${clients.length} credentials)`
+            );
+
+            const remaining = partition.length - (i + CONCURRENCY);
+            if (remaining > 0) await hr.sleep(BATCH_DELAY_MS);
+          }
+          return partitionRows;
+        })
+      );
+
+      for (const rows of partitionResults) {
+        allProgressRows.push(...rows);
       }
     }
 
     // ── Step 5: Upsert all rows to Supabase ───────────────────────────────
+
     console.log(`\n[progress] Upserting ${allProgressRows.length} progress rows to Supabase...`);
     jobStore.updateJob(jobId, { message: `Writing ${allProgressRows.length} rows to database...` });
 
