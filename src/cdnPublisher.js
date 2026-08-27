@@ -106,7 +106,7 @@ async function publishGlobalLeaderboard() {
     while (true) {
       const { data: pageRows, error: pErr } = await supabase
         .from('progress')
-        .select('user_id, question_id, score, status')
+        .select('user_id, question_id, score, status, max_score')
         .or('score.gt.0,status.eq.solved')
         .order('id', { ascending: true })
         .range(pFrom, pFrom + pStep - 1);
@@ -124,15 +124,16 @@ async function publishGlobalLeaderboard() {
       if (!p.user_id || !p.question_id) return;
       const key = `${p.user_id}:${p.question_id}`;
       const existing = userQuestionMap.get(key);
+      const isSolved = p.status === 'solved' && (p.max_score > 0 ? (p.score || 0) >= p.max_score : (p.score || 0) > 0);
       if (!existing) {
         userQuestionMap.set(key, {
           user_id: p.user_id,
           score: p.score || 0,
-          isSolved: p.status === 'solved',
+          isSolved,
         });
       } else {
         existing.score = Math.max(existing.score, p.score || 0);
-        if (p.status === 'solved') existing.isSolved = true;
+        if (isSolved) existing.isSolved = true;
       }
     });
 
@@ -198,7 +199,7 @@ async function publishContestCache(contestId) {
     const teams = [];
     (assignments || []).forEach((a) => {
       if (a.group_id) groupIds.push(a.group_id);
-      if (a.team) teams.push(a.team);
+      if (a.team && a.team.trim() !== '') teams.push(a.team.trim());
     });
 
     const assignedUserIds = new Set();
@@ -206,26 +207,33 @@ async function publishContestCache(contestId) {
     if (groupIds.length > 0) {
       const { data: groupMembers } = await supabase
         .from('group_members')
-        .select('user_id')
-        .in('group_id', groupIds);
-      (groupMembers || []).forEach((gm) => assignedUserIds.add(gm.user_id));
+        .select('user_id, users!inner(role)')
+        .in('group_id', groupIds)
+        .neq('users.role', 'admin');
+      (groupMembers || []).forEach((gm) => {
+        if (gm.user_id) assignedUserIds.add(gm.user_id);
+      });
     }
 
     if (teams.length > 0) {
       const { data: teamUsers } = await supabase
         .from('users')
         .select('id')
-        .in('team', teams);
-      (teamUsers || []).forEach((tu) => assignedUserIds.add(tu.id));
+        .in('team', teams)
+        .neq('role', 'admin');
+      (teamUsers || []).forEach((tu) => {
+        if (tu.id) assignedUserIds.add(tu.id);
+      });
     }
 
-    // Fetch user details for assigned users
+    // Fetch user details for assigned users (strictly non-admin)
     const userList = [];
     if (assignedUserIds.size > 0) {
       const { data: users } = await supabase
         .from('users')
         .select('id, full_name, emp_id, team')
-        .in('id', Array.from(assignedUserIds));
+        .in('id', Array.from(assignedUserIds))
+        .neq('role', 'admin');
       if (users) userList.push(...users);
     }
 
@@ -269,17 +277,21 @@ async function publishContestCache(contestId) {
       if (!enabledQuestionIds.has(p.question_id)) return;
       const u = leaderboardMap.get(p.user_id);
       if (u) {
-        if (p.status === 'solved') u.solved++;
-        u.score += p.score || 0;
-        const isActive = p.status === 'solved' || p.status === 'attempted' || (p.score || 0) > 0;
+        const score = p.score || 0;
+        const maxScore = p.max_score || 10;
+        const isSolved = p.status === 'solved' && maxScore > 0 && score >= maxScore;
+        if (isSolved) u.solved++;
+        u.score += score;
+        const isActive = isSolved || p.status === 'attempted' || score > 0;
         const subTime = p.last_submission_at || (isActive ? p.updated_at : null);
         if (subTime && (!u.lastActive || new Date(subTime) > new Date(u.lastActive))) {
           u.lastActive = subTime;
         }
         u.progress.push({
           question_id: p.question_id,
-          status: p.status,
-          score: p.score,
+          status: isSolved ? 'solved' : (score > 0 || p.status === 'attempted' ? 'attempted' : (p.status || 'unattempted')),
+          score,
+          max_score: maxScore,
           last_submission_at: p.last_submission_at,
         });
       }

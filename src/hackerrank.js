@@ -395,12 +395,12 @@ async function fetchUserComparison(client, contestSlug, refHacker, studentHacker
     if (!slug) continue;
 
     const score = typeof ch.score2 === 'number' ? ch.score2 : (parseFloat(ch.score2) || 0);
-    const attempted = !!ch.attempted2;
+    const maxScore = ch.point || ch.max_score || 0;
 
     let status = 'unattempted';
-    if (score > 0) {
+    if (maxScore > 0 && score >= maxScore) {
       status = 'solved';
-    } else if (attempted) {
+    } else if (attempted || score > 0) {
       status = 'attempted';
     }
 

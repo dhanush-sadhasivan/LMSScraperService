@@ -431,9 +431,12 @@ function _buildDenseRowsFromCompare(questions, questionIdMap, contestId, user_id
 
     if (item) {
       score = Math.max(0, Math.round(parseFloat(item.score) || 0));
-      status = item.status; // 'solved' | 'attempted' | 'unattempted'
-      if (score > 0 && status !== 'solved') {
+      if (maxScore > 0 && score >= maxScore) {
         status = 'solved';
+      } else if (item.status === 'attempted' || item.attempted || score > 0) {
+        status = 'attempted';
+      } else {
+        status = item.status || 'unattempted';
       }
     }
 
