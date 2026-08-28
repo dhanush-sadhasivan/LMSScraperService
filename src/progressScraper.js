@@ -306,7 +306,17 @@ async function run(jobId, contestId, contestSlug, questions, users) {
     const lmsBaseUrl = process.env.LMS_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     try {
       const axios = require('axios');
-      await axios.post(`${lmsBaseUrl}/api/scrape/revalidate?contestId=${contestId}`, {}, { timeout: 5000 });
+      await axios.post(
+        `${lmsBaseUrl}/api/scrape/revalidate?contestId=${contestId}`,
+        {},
+        {
+          timeout: 8000,
+          headers: {
+            // Must match RAILWAY_API_KEY env var in the LMS deployment
+            'x-api-key': process.env.API_KEY || process.env.RAILWAY_API_KEY || '',
+          },
+        }
+      );
       console.log(`[progress] 🔄 Triggered automatic LMS dashboard revalidation at ${lmsBaseUrl}`);
     } catch (revalErr) {
       console.warn(`[progress] LMS revalidation ping skipped: ${revalErr.message}`);
