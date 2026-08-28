@@ -350,9 +350,18 @@ async function _processUser(
   const dbUserScore = dbEntry ? dbEntry.totalScore : -1;
 
   // ── SMART SKIP: If user's leaderboard score matches DB score & all rows exist, skip fetching! ──
+  // We also compare the number of solved questions to avoid false positives when the
+  // leaderboard total score matches but the per-challenge distribution changed.
   if (dbUserScore !== -1 && leaderboardScore === dbUserScore && dbEntry?.rows?.length === questions.length) {
-    console.log(`[progress]   ⚡ [skip-unchanged] ${hackerrank_id}: score unchanged (${leaderboardScore} pts). Skipping fetch.`);
-    return dbEntry.rows;
+    const dbSolvedCount = dbEntry.rows.filter(r => r.status === 'solved').length;
+    const leaderSolvedCount = leaderEntry?.hasPerChallengeData
+      ? Object.values(leaderEntry.challenges).filter(ch => (ch.score ?? 0) > 0).length
+      : null; // unknown — can't verify, be conservative
+    if (leaderSolvedCount === null || leaderSolvedCount === dbSolvedCount) {
+      console.log(`[progress]   ⚡ [skip-unchanged] ${hackerrank_id}: score ${leaderboardScore} pts, ${dbSolvedCount} solved. Skipping fetch.`);
+      return dbEntry.rows;
+    }
+    console.log(`[progress]   ⚠️  [skip-overridden] ${hackerrank_id}: score unchanged (${leaderboardScore} pts) but solved count changed (DB: ${dbSolvedCount}, leaderboard: ${leaderSolvedCount}). Refetching.`);
   }
 
   let userSubmittedAt = leaderEntry?.submittedAt || null;
@@ -371,8 +380,23 @@ async function _processUser(
   if (refHacker && refHacker.toLowerCase() !== hackerrank_id.toLowerCase()) {
     const compareMap = await hr.fetchUserComparison(client, contestSlug, refHacker, hackerrank_id);
     if (compareMap && compareMap.size > 0) {
-      console.log(`[progress]   [compare-api] ${hackerrank_id}: ${compareMap.size} challenges resolved`);
-      return _buildDenseRowsFromCompare(questions, questionIdMap, contestId, user_id, compareMap, userSubmittedAt, now);
+      // Check actual coverage: how many of this contest's questions exist in compareMap.
+      // The compare endpoint only returns challenges either user attempted — if the
+      // logged-in admin account hasn't tried all problems, the rest would be silently
+      // missed and incorrectly marked unattempted.
+      const coveredCount = _countCoverage(questions, compareMap);
+      console.log(`[progress]   [compare-api] ${hackerrank_id}: ${compareMap.size} API challenges, ${coveredCount}/${questions.length} questions matched`);
+
+      if (coveredCount >= questions.length) {
+        // Full coverage — safe to use compare results directly
+        return _buildDenseRowsFromCompare(questions, questionIdMap, contestId, user_id, compareMap, userSubmittedAt, now);
+      }
+
+      // Partial coverage — supplement with direct per-user API for questions that
+      // the compare API didn't return data for.
+      console.log(`[progress]   [compare-api] ${hackerrank_id}: partial coverage, supplementing with per-user API...`);
+      const supplementMap = await hr.fetchUserChallenges(client, contestSlug, hackerrank_id) || new Map();
+      return _buildDenseRowsFromCompareWithSupplement(questions, questionIdMap, contestId, user_id, compareMap, supplementMap, userSubmittedAt, now);
     }
   } else if (refHacker && refHacker.toLowerCase() === hackerrank_id.toLowerCase()) {
     // Self-user (logged in admin user): fetch submissions via 1 bulk API call
@@ -385,18 +409,19 @@ async function _processUser(
   let challengeMap = null;
 
   if (leaderEntry && leaderEntry.hasPerChallengeData) {
-    // Best case: per-challenge data from leaderboard
-    challengeMap = new Map(
-      Object.entries(leaderEntry.challenges).map(([slug, ch]) => [
-        slug,
-        {
-          score: ch.score ?? 0,
-          timestamp: ch.timestamp ? new Date(ch.timestamp * 1000).toISOString() : leaderEntry.submittedAt,
-          status: null,
-        },
-      ])
-    );
-    console.log(`[progress]   [leaderboard] ${hackerrank_id}: ${challengeMap.size} challenges found`);
+    // Best case: per-challenge data from leaderboard — index by both raw & normalized slug
+    challengeMap = new Map();
+    for (const [slug, ch] of Object.entries(leaderEntry.challenges)) {
+      const val = {
+        score: ch.score ?? 0,
+        timestamp: ch.timestamp ? new Date(ch.timestamp * 1000).toISOString() : leaderEntry.submittedAt,
+        status: null,
+      };
+      challengeMap.set(slug, val);
+      challengeMap.set(slug.toLowerCase(), val);
+      challengeMap.set(slug.replace(/[^a-z0-9]/gi, '').toLowerCase(), val);
+    }
+    console.log(`[progress]   [leaderboard] ${hackerrank_id}: ${Object.keys(leaderEntry.challenges).length} challenges found`);
   } else if (isComplete) {
     // Leaderboard is fully loaded and user isn't there → definitely 0 score
     console.log(`[progress]   [fast-path] ${hackerrank_id}: not in leaderboard (0 score)`);
@@ -411,6 +436,7 @@ async function _processUser(
   return _buildDenseRows(questions, questionIdMap, contestId, user_id, challengeMap ?? new Map(), now);
 }
 
+
 /**
  * Build dense rows from compare API results (Extension e logic).
  */
@@ -422,8 +448,8 @@ function _buildDenseRowsFromCompare(questions, questionIdMap, contestId, user_id
     const questionId = _resolveQuestionId(questionIdMap, q.slug, idx);
     if (!questionId) continue;
 
-    const slugKey = q.slug ? q.slug.toLowerCase() : '';
-    const item = compareMap.get(slugKey);
+    // Multi-format slug lookup to survive slug differences across HackerRank endpoints
+    const item = _lookupCompareItem(compareMap, q.slug);
     const maxScore = Math.max(0, Math.round(parseFloat(q.maxScore) || item?.maxScore || 10));
 
     let status = 'unattempted';
@@ -458,6 +484,67 @@ function _buildDenseRowsFromCompare(questions, questionIdMap, contestId, user_id
 }
 
 /**
+ * Build dense rows merging compare API data (authoritative for covered questions)
+ * with per-user API data for questions that compareMap didn't cover.
+ */
+function _buildDenseRowsFromCompareWithSupplement(questions, questionIdMap, contestId, user_id, compareMap, supplementMap, userSubmittedAt, now) {
+  const rows = [];
+
+  for (let idx = 0; idx < questions.length; idx++) {
+    const q = questions[idx];
+    const questionId = _resolveQuestionId(questionIdMap, q.slug, idx);
+    if (!questionId) continue;
+
+    // Prefer compare API entry; fall back to supplement (user-challenges API)
+    const item = _lookupCompareItem(compareMap, q.slug);
+    const maxScore = Math.max(0, Math.round(parseFloat(q.maxScore) || item?.maxScore || 10));
+
+    let status = 'unattempted';
+    let score = 0;
+    let subTime = null;
+
+    if (item) {
+      // Compare API has data for this question
+      score = Math.max(0, Math.round(parseFloat(item.score) || 0));
+      if (maxScore > 0 && score >= maxScore) {
+        status = 'solved';
+      } else if (item.status === 'attempted' || item.attempted || score > 0) {
+        status = 'attempted';
+      } else {
+        status = item.status || 'unattempted';
+      }
+      subTime = (status === 'solved' || status === 'attempted') ? (item.timestamp || userSubmittedAt || null) : null;
+    } else {
+      // Compare API missed this question — use supplement data
+      const sub = _lookupSubmissionItem(supplementMap, q.slug);
+      if (sub) {
+        score = Math.max(0, Math.round(parseFloat(sub.score) || 0));
+        subTime = sub.timestamp || null;
+        if (sub.status === 'Accepted' || sub.status === 'accepted' || (score >= maxScore && maxScore > 0)) {
+          status = 'solved';
+        } else {
+          status = 'attempted';
+        }
+      }
+    }
+
+    rows.push({
+      contest_id: contestId,
+      user_id,
+      question_id: questionId,
+      status,
+      score,
+      max_score: maxScore,
+      last_submission_at: subTime,
+      updated_at: now,
+    });
+  }
+
+  return rows;
+}
+
+
+/**
  * Build a dense array of progress rows (one per question per user).
  * Dense = include unattempted rows too.
  */
@@ -469,7 +556,8 @@ function _buildDenseRows(questions, questionIdMap, contestId, user_id, challenge
     const questionId = _resolveQuestionId(questionIdMap, q.slug, idx);
     if (!questionId) continue;
 
-    const sub = challengeMap.get(q.slug);
+    // Try multiple slug formats to survive API slug inconsistencies
+    const sub = _lookupSubmissionItem(challengeMap, q.slug);
     const maxScore = Math.max(0, Math.round(parseFloat(q.maxScore) || 10));
 
     let status, score, lastSubmissionAt;
@@ -540,4 +628,55 @@ function _resolveQuestionId(map, slug, idx) {
   );
 }
 
+/**
+ * Look up a compareMap entry using multiple slug formats.
+ * HackerRank's compare API and challenges API sometimes use slightly different slugs.
+ *
+ * @param {Map} compareMap
+ * @param {string|undefined} slug
+ * @returns {any|undefined}
+ */
+function _lookupCompareItem(compareMap, slug) {
+  if (!slug) return undefined;
+  return (
+    compareMap.get(slug) ||
+    compareMap.get(slug.toLowerCase()) ||
+    compareMap.get(slug.replace(/[^a-z0-9]/gi, '').toLowerCase())
+  );
+}
+
+/**
+ * Look up a submission map entry using multiple slug formats.
+ * Same normalization as _lookupCompareItem.
+ *
+ * @param {Map} map
+ * @param {string|undefined} slug
+ * @returns {any|undefined}
+ */
+function _lookupSubmissionItem(map, slug) {
+  if (!slug) return undefined;
+  return (
+    map.get(slug) ||
+    map.get(slug.toLowerCase()) ||
+    map.get(slug.replace(/[^a-z0-9]/gi, '').toLowerCase())
+  );
+}
+
+/**
+ * Count how many questions from the contest have a matching entry in compareMap.
+ * Uses the same multi-format slug matching used during row building.
+ *
+ * @param {Array<{slug: string}>} questions
+ * @param {Map} compareMap
+ * @returns {number}
+ */
+function _countCoverage(questions, compareMap) {
+  let count = 0;
+  for (const q of questions) {
+    if (_lookupCompareItem(compareMap, q.slug) !== undefined) count++;
+  }
+  return count;
+}
+
 module.exports = { run };
+

@@ -382,6 +382,7 @@ async function fetchUserComparison(client, contestSlug, refHacker, studentHacker
   }
 
   const result = new Map();
+
   for (const ch of data.model.challenges) {
     // Determine challenge slug
     let slug = ch.slug || ch.challenge_slug;
@@ -417,18 +418,26 @@ async function fetchUserComparison(client, contestSlug, refHacker, studentHacker
       }
     }
 
-    result.set(slug.toLowerCase(), {
+    const entry = {
       score,
       attempted,
       status,
       name: ch.name || '',
       maxScore: ch.point || 0,
       timestamp,
-    });
+    };
+
+    // Store under multiple slug formats so downstream lookup survives slug variations
+    // between the challenges endpoint and the compare endpoint.
+    const keyLower = slug.toLowerCase();
+    const keyNorm  = slug.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    result.set(keyLower, entry);
+    if (keyNorm !== keyLower) result.set(keyNorm, entry);
   }
 
   return result;
 }
+
 
 /**
  * Fast lookup for user's latest submission timestamp in a contest.
