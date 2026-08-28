@@ -231,7 +231,7 @@ async function publishContestCache(contestId) {
     if (assignedUserIds.size > 0) {
       const { data: users } = await supabase
         .from('users')
-        .select('id, full_name, emp_id, team')
+        .select('id, full_name, emp_id, team, hackerrank_id, leetcode_id')
         .in('id', Array.from(assignedUserIds))
         .neq('role', 'admin');
       if (users) userList.push(...users);
@@ -244,6 +244,8 @@ async function publishContestCache(contestId) {
         name: u.full_name || 'Anonymous',
         emp_id: u.emp_id || '—',
         team: u.team || 'N/A',
+        hackerrank_id: u.hackerrank_id || null,
+        leetcode_id: u.leetcode_id || null,
         solved: 0,
         total: enabledQuestions.length,
         score: 0,
