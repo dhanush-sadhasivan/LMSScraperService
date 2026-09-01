@@ -15,6 +15,22 @@ const BUCKET_NAME = 'api-cache';
 const CACHE_CONTROL_HEADER = 'public, max-age=180, s-maxage=180'; // 3 minutes CDN cache
 
 /**
+ * Canonical check for whether a submission/progress record is solved.
+ * Returns true if and only if p.status === 'solved' AND
+ * (if max_score > 0, score >= max_score; otherwise score > 0).
+ */
+function isRecordSolved(p) {
+  if (!p) return false;
+  if (p.status !== 'solved') return false;
+  const score = p.score != null ? Number(p.score) : 0;
+  const maxScore = p.max_score != null ? Number(p.max_score) : 0;
+  if (Number.isFinite(maxScore) && maxScore > 0) {
+    return Number.isFinite(score) && score >= maxScore;
+  }
+  return Number.isFinite(score) && score > 0;
+}
+
+/**
  * Upload a JSON snapshot to Supabase Storage.
  *
  * @param {string} fileName - E.g. 'leaderboard.json' or 'contest_<id>.json'
@@ -31,7 +47,7 @@ async function _uploadJsonSnapshot(fileName, data) {
       .from(BUCKET_NAME)
       .upload(fileName, buffer, {
         contentType: 'application/json',
-        cacheControl: '180',
+        cacheControl: '0',
         upsert: true,
       });
 
@@ -124,7 +140,7 @@ async function publishGlobalLeaderboard() {
       if (!p.user_id || !p.question_id) return;
       const key = `${p.user_id}:${p.question_id}`;
       const existing = userQuestionMap.get(key);
-      const isSolved = p.status === 'solved' && (p.max_score > 0 ? (p.score || 0) >= p.max_score : (p.score || 0) > 0);
+      const isSolved = isRecordSolved(p);
       if (!existing) {
         userQuestionMap.set(key, {
           user_id: p.user_id,
@@ -147,7 +163,7 @@ async function publishGlobalLeaderboard() {
 
     // 4. Sort and format leaderboard
     const globalPerformers = Array.from(userMap.values())
-      .sort((a, b) => (b.score - a.score) || (b.solved - a.solved));
+      .sort((a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || ''));
 
     const payload = {
       updated_at: new Date().toISOString(),
@@ -274,32 +290,58 @@ async function publishContestCache(contestId) {
       from += step;
     }
 
-    // Overlay progress on assigned users
+    // Overlay progress on assigned users with deduplication
+    const contestUserQuestionMap = new Map();
     progressRows.forEach((p) => {
-      if (!enabledQuestionIds.has(p.question_id)) return;
+      if (!p.user_id || !p.question_id || !enabledQuestionIds.has(p.question_id)) return;
+      const key = `${p.user_id}:${p.question_id}`;
+      const isSolved = isRecordSolved(p);
+      const score = Number(p.score) || 0;
+      const maxScore = Number(p.max_score) || 10;
+      const isActive = isSolved || p.status === 'attempted' || score > 0;
+      const subTime = p.last_submission_at || (isActive ? p.updated_at : null);
+
+      const existing = contestUserQuestionMap.get(key);
+      if (!existing) {
+        contestUserQuestionMap.set(key, {
+          ...p,
+          score,
+          max_score: maxScore,
+          isSolved,
+          isActive,
+          subTime,
+        });
+      } else {
+        existing.score = Math.max(existing.score, score);
+        if (isSolved) existing.isSolved = true;
+        if (isActive) existing.isActive = true;
+        if (subTime && (!existing.subTime || new Date(subTime) > new Date(existing.subTime))) {
+          existing.subTime = subTime;
+        }
+      }
+    });
+
+    contestUserQuestionMap.forEach((p) => {
       const u = leaderboardMap.get(p.user_id);
       if (u) {
-        const score = p.score || 0;
-        const maxScore = p.max_score || 10;
-        const isSolved = p.status === 'solved' && maxScore > 0 && score >= maxScore;
-        if (isSolved) u.solved++;
-        u.score += score;
-        const isActive = isSolved || p.status === 'attempted' || score > 0;
-        const subTime = p.last_submission_at || (isActive ? p.updated_at : null);
-        if (subTime && (!u.lastActive || new Date(subTime) > new Date(u.lastActive))) {
-          u.lastActive = subTime;
+        if (p.isSolved) u.solved++;
+        u.score += p.score;
+        if (p.subTime && (!u.lastActive || new Date(p.subTime) > new Date(u.lastActive))) {
+          u.lastActive = p.subTime;
         }
         u.progress.push({
           question_id: p.question_id,
-          status: isSolved ? 'solved' : (score > 0 || p.status === 'attempted' ? 'attempted' : (p.status || 'unattempted')),
-          score,
-          max_score: maxScore,
+          status: p.isSolved ? 'solved' : (p.score > 0 || p.status === 'attempted' ? 'attempted' : (p.status || 'unattempted')),
+          score: p.score,
+          max_score: p.max_score,
           last_submission_at: p.last_submission_at,
         });
       }
     });
 
-    const sortedLeaderboard = Array.from(leaderboardMap.values()).sort((a, b) => b.score - a.score);
+    const sortedLeaderboard = Array.from(leaderboardMap.values()).sort(
+      (a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || '')
+    );
 
     const payload = {
       contest_id: contestId,
