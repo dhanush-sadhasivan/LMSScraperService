@@ -161,9 +161,16 @@ async function publishGlobalLeaderboard() {
       }
     });
 
-    // 4. Sort and format leaderboard
+    // 4. Sort and format leaderboard (Sanitized: display-safe fields only, NO emp_id, email, or UUIDs)
     const globalPerformers = Array.from(userMap.values())
-      .sort((a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || ''));
+      .sort((a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || ''))
+      .map((entry, idx) => ({
+        rank: idx + 1,
+        name: entry.name,
+        team: entry.team,
+        score: entry.score,
+        solved: entry.solved,
+      }));
 
     const payload = {
       updated_at: new Date().toISOString(),
@@ -339,14 +346,44 @@ async function publishContestCache(contestId) {
       }
     });
 
-    const sortedLeaderboard = Array.from(leaderboardMap.values()).sort(
-      (a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || '')
-    );
+    // Sanitize leaderboard for public CDN snapshot (strictly no internal user_id, emp_id, or email)
+    const sortedLeaderboard = Array.from(leaderboardMap.values())
+      .sort((a, b) => (b.score - a.score) || (b.solved - a.solved) || (a.name || '').localeCompare(b.name || ''))
+      .map((entry, idx) => ({
+        rank: idx + 1,
+        name: entry.name,
+        team: entry.team,
+        hackerrank_id: entry.hackerrank_id || null,
+        leetcode_id: entry.leetcode_id || null,
+        solved: entry.solved,
+        total: entry.total,
+        score: entry.score,
+        maxScore: entry.maxScore,
+        lastActive: entry.lastActive,
+        progress: (entry.progress || []).map((p) => ({
+          question_id: p.question_id,
+          status: p.status,
+          score: p.score,
+          max_score: p.max_score,
+          last_submission_at: p.last_submission_at,
+        })),
+      }));
+
+    const sanitizedQuestions = (allQuestions || []).map((q) => ({
+      id: q.id,
+      slug: q.slug,
+      title: q.title,
+      difficulty: q.difficulty,
+      domain: q.domain,
+      max_score: q.max_score,
+      order_index: q.order_index,
+      is_enabled: q.is_enabled,
+    }));
 
     const payload = {
       contest_id: contestId,
       updated_at: new Date().toISOString(),
-      questions: allQuestions,
+      questions: sanitizedQuestions,
       enabled_question_count: enabledQuestions.length,
       total_max_score: totalMaxScore,
       leaderboard: sortedLeaderboard,
@@ -380,27 +417,15 @@ async function publishRoadmapAnalytics() {
 }
 
 /**
- * Publish Internal Training trainer overview snapshot (it_trainer_overview.json).
+ * Publish Internal Training trainer overview snapshot (disabled from public CDN).
  */
 async function publishITTrainerOverview() {
-  const supabase = getSupabaseClient();
-  try {
-    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_it_trainer_overview');
-    if (!rpcErr && rpcData) {
-      await _uploadJsonSnapshot('it_trainer_overview.json', {
-        updated_at: new Date().toISOString(),
-        trainers: rpcData,
-      });
-      return true;
-    }
-  } catch (err) {
-    console.warn('[cdnPublisher] ⚠️ Error publishing IT trainer overview snapshot:', err.message);
-  }
+  // Disabled: IT overview contains trainer emails and employee details and must not be published to the public bucket.
   return false;
 }
 
 /**
- * Publish contest snapshot, global leaderboard, roadmap analytics, and IT overview snapshots.
+ * Publish contest snapshot, global leaderboard, and roadmap analytics snapshots.
  *
  * @param {string} contestId
  */
@@ -410,7 +435,6 @@ async function publishContestAndGlobalCache(contestId) {
       publishContestCache(contestId),
       publishGlobalLeaderboard(),
       publishRoadmapAnalytics(),
-      publishITTrainerOverview(),
     ]);
     console.log(`[cdnPublisher] ✅ All CDN cache snapshots generated successfully for contest ${contestId}`);
   } catch (err) {
